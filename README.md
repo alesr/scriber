@@ -58,7 +58,7 @@ func main() {
     inputFile, err := os.Open("path/to/example.mp4")
     if err != nil {
         logger.Error("Failed to open input file", slog.Error(err))
-        return
+        os.Exit(1)
     }
     defer inputFile.Close()
 
@@ -72,6 +72,7 @@ func main() {
     ctx := context.Background()
     if err := s.Process(ctx, input); err != nil {
         logger.Error("Failed to process file", slog.Error(err))
+        os.Exit(1)
     }
 
     for result := range s.Collect() {
