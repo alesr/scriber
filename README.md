@@ -55,11 +55,18 @@ func main() {
 
     s := scriber.New(logger, whisperCli)
 
+    inputFile, err := os.Open("path/to/example.mp4")
+    if err != nil {
+        logger.Error("Failed to open input file", slog.Error(err))
+        return
+    }
+    defer inputFile.Close()
+
     input := scriber.Input{
         Name:       "example.mp4",
         OutputType: scriber.OutputTypeSubtitles,
         Language:   "en",
-        Data:       os.Open("path/to/example.mp4"),
+        Data:       inputFile,
     }
 
     ctx := context.Background()
