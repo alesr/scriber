@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"time"
 
 	"log/slog"
 
@@ -78,9 +79,6 @@ func TestTranscribeAudio(t *testing.T) {
 	}
 
 	scriber := New(noopLogger(), mockClient)
-	scriber.convertToWavFunc = func(data []byte) (*bytes.Buffer, error) {
-		return bytes.NewBufferString("mock audio data"), nil
-	}
 
 	audioData := bytes.NewBufferString("mock audio data")
 
@@ -88,9 +86,10 @@ func TestTranscribeAudio(t *testing.T) {
 		Name:       "test.mp4",
 		Language:   "en",
 		OutputType: OutputTypeSubtitles,
+		Data:       io.NopCloser(audioData),
 	}
 
-	ctx := context.Background()
+	ctx := context.TODO()
 	text, err := scriber.transcribeAudio(ctx, audioData, in)
 
 	require.NoError(t, err)
@@ -184,16 +183,18 @@ func TestProcess(t *testing.T) {
 
 	mockClient := &mockWhisperClient{
 		transcribeAudioFunc: func(ctx context.Context, in whisperclient.TranscribeAudioInput) ([]byte, error) {
+			// Drain the input data to prevent deadlock.
+			_, err := io.Copy(io.Discard, in.Data)
+			require.NoError(t, err)
 			return []byte("mock transcription"), nil
 		},
 	}
 
-	scriber := New(noopLogger(), mockClient)
-
 	testCases := []struct {
-		name    string
-		input   Input
-		wantErr bool
+		name                 string
+		input                Input
+		givenConvertToWavErr error
+		expectResult         bool
 	}{
 		{
 			name: "valid input",
@@ -201,32 +202,67 @@ func TestProcess(t *testing.T) {
 				Name:       "test.mp4",
 				OutputType: OutputTypeSubtitles,
 				Language:   "en",
-				Data:       io.NopCloser(bytes.NewBufferString("mock data")),
+				Data:       io.NopCloser(bytes.NewBufferString("foo")),
 			},
-			wantErr: false,
+			givenConvertToWavErr: nil,
+			expectResult:         true,
 		},
 		{
-			name: "invalid input",
+			name: "convert to wav error",
 			input: Input{
-				Name:       "",
+				Name:       "test.mp4",
 				OutputType: OutputTypeSubtitles,
 				Language:   "en",
-				Data:       io.NopCloser(bytes.NewBufferString("mock data")),
+				Data:       io.NopCloser(bytes.NewBufferString("bar")),
 			},
-			wantErr: true,
+			givenConvertToWavErr: assert.AnError,
+			expectResult:         false,
 		},
 	}
 
 	for _, tc := range testCases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := context.Background()
+			scriber := Scriber{
+				logger:        noopLogger(),
+				whisperClient: mockClient,
+				convertToWavFunc: func(r io.Reader, w io.Writer) error {
+					_, err := io.Copy(w, r)
+					require.NoError(t, err)
+					return tc.givenConvertToWavErr
+				},
+				resultsCh: make(chan Output),
+			}
+
+			var resultCh chan struct{}
+			if tc.expectResult {
+				resultCh = make(chan struct{})
+				go func() {
+					defer close(resultCh)
+					select {
+					case output := <-scriber.Collect():
+						assert.Equal(t, generateOutputFileName(tc.input.Name, tc.input.OutputType), output.Name)
+						assert.Equal(t, []byte("mock transcription"), output.Text)
+					case <-time.After(5 * time.Second):
+						t.Error("timeout waiting for result")
+					}
+				}()
+			}
+
+			ctx := context.TODO()
 			err := scriber.Process(ctx, tc.input)
-			if tc.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
+
+			assert.ErrorIs(t, err, tc.givenConvertToWavErr)
+
+			// Only wait for results if we expect them
+			if tc.expectResult {
+				select {
+				case <-resultCh:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timeout waiting for result collection")
+				}
 			}
 		})
 	}
