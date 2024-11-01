@@ -1,7 +1,6 @@
 package scriber
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -24,7 +23,7 @@ const (
 var (
 	supportedOutputTypes = map[OutputType]struct{}{OutputTypeSubtitles: {}, OutputTypeTranscript: {}}
 
-	convertToWav convertToWavFunc = func(data []byte) (*bytes.Buffer, error) {
+	convertToWav convertToWavFunc = func(r io.Reader, w io.Writer) error {
 		cmd := exec.Command(
 			"ffmpeg", "-y",
 			"-i", "pipe:0",
@@ -37,20 +36,32 @@ var (
 			"pipe:1",
 		)
 
-		var outBuf bytes.Buffer
-		cmd.Stdout = &outBuf
-		cmd.Stdin = bytes.NewReader(data)
+		cmd.Stdout = w
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return fmt.Errorf("failed to create stdin pipe: %w", err)
+		}
 		cmd.Stderr = os.Stderr
 
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("ffmpeg failed: %w", err)
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("failed to start ffmpeg: %w", err)
 		}
-		return &outBuf, nil
+
+		go func() {
+			defer stdin.Close()
+			if _, err := io.Copy(stdin, r); err != nil {
+				fmt.Fprintf(os.Stderr, "error copying to stdin: %v\n", err)
+			}
+		}()
+
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("ffmpeg failed: %w", err)
+		}
+		return nil
 	}
 )
 
 type (
-
 	// whisperClient is a client for the whisper service.
 	whisperClient interface {
 		TranscribeAudio(ctx context.Context, in whisperclient.TranscribeAudioInput) ([]byte, error)
@@ -66,7 +77,7 @@ type (
 	}
 
 	// convertToWavFunc is a function that converts audio data to wav format.
-	convertToWavFunc func(data []byte) (*bytes.Buffer, error)
+	convertToWavFunc func(r io.Reader, w io.Writer) error
 )
 
 // Input represents an input file to be processed.
@@ -121,25 +132,63 @@ func New(logger *slog.Logger, whisperCli whisperClient) *Scriber {
 func (s *Scriber) Process(ctx context.Context, in Input) error {
 	s.logger.Info("Processing file", slog.String("name", in.Name))
 
-	data, err := io.ReadAll(in.Data)
-	if err != nil {
-		return fmt.Errorf("reading input: %w", err)
-	}
-	defer in.Data.Close()
-
-	audioData, err := convertToWav(data)
-	if err != nil {
-		return fmt.Errorf("could not convert to wav: %w", err)
+	if err := in.validate(); err != nil {
+		return fmt.Errorf("invalid input: %w", err)
 	}
 
-	text, err := s.transcribeAudio(ctx, audioData, in)
+	// Create pipes for conversion.
+	// The pipeWriter will be used for writing the audio data from the input to ffmpeg.
+	// The pipeReader will be used for reading the converted audio from ffmpeg and transcribing it.
+	// Basically, we are converting the audio and transcribing it at the same time.
+	// This is done to avoid writing the converted audio to disk or holding it in memory.
+	pipeReader, pipeWriter := io.Pipe()
+
+	errCh := make(chan error, 1)
+
+	// Start conversion in goroutine
+	go func() {
+		defer func() {
+			if err := pipeWriter.Close(); err != nil {
+				select {
+				case errCh <- fmt.Errorf("error closing pipe writer: %w", err):
+				default:
+				}
+			}
+		}()
+
+		if err := s.convertToWavFunc(in.Data, pipeWriter); err != nil {
+			errCh <- fmt.Errorf("could not convert to wav: %w", err)
+			return
+		}
+		close(errCh)
+	}()
+
+	defer func() {
+		in.Data.Close()
+		pipeReader.Close()
+	}()
+
+	text, err := s.transcribeAudio(ctx, pipeReader, in)
 	if err != nil {
 		return fmt.Errorf("could not transcribe audio: %w", err)
 	}
 
-	s.resultsCh <- Output{
-		Name: generateOutputFileName(in.Name, in.OutputType), // foo.mp4 -> foo.srt
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case s.resultsCh <- Output{
+		Name: generateOutputFileName(in.Name, in.OutputType),
 		Text: text,
+	}:
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
 	s.logger.Info("Processing complete", slog.String("file", in.Name))
@@ -150,7 +199,7 @@ func (s *Scriber) Collect() <-chan Output {
 	return s.resultsCh
 }
 
-func (s *Scriber) transcribeAudio(ctx context.Context, audioData *bytes.Buffer, in Input) ([]byte, error) {
+func (s *Scriber) transcribeAudio(ctx context.Context, audioData io.Reader, in Input) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
